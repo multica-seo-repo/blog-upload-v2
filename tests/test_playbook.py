@@ -1,0 +1,177 @@
+"""Tests for the playbook module — frontmatter index + journal.
+
+Isolation mirrors test_workspace: patch workspace.Path.cwd to a temp dir so
+playbooks land in <tmp>/blog-upload-workspace/data/playbooks/.
+
+Run from the skill root:
+    PYTHONPATH=. python3 -B -m unittest tests.test_playbook -v
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts.tools import playbook, workspace
+
+
+class PlaybookTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+        self._cwd_patch = mock.patch.object(workspace.Path, "cwd", return_value=self.cwd)
+        self._cwd_patch.start()
+        # Pin the beside-skill canonical workspace into the tmp tree so root()
+        # never falls back to the real workspace when nothing is found.
+        self._canon = mock.patch.object(
+            workspace, "_canonical_workspace",
+            return_value=self.cwd / "blog-upload-workspace",
+        )
+        self._canon.start()
+
+    def tearDown(self) -> None:
+        self._canon.stop()
+        self._cwd_patch.stop()
+        self._tmp.cleanup()
+
+    # --- frontmatter parse / serialize -------------------------------------
+
+    def test_frontmatter_roundtrip(self) -> None:
+        text = "---\nsummary: A short fact\naliases: brandx, brand-y\n---\n# body\n"
+        meta, body = playbook._parse_frontmatter(text)
+        self.assertEqual(meta["summary"], "A short fact")
+        self.assertEqual(meta["aliases"], ["brandx", "brand-y"])
+        self.assertEqual(body, "# body\n")
+        # serialize emits summary then aliases, fenced
+        out = playbook._serialize_frontmatter(meta)
+        self.assertEqual(out, "---\nsummary: A short fact\naliases: brandx, brand-y\n---\n")
+
+    def test_crlf_frontmatter_is_parsed(self) -> None:
+        # A Windows-edited (CRLF) playbook must still match the fence so the
+        # always-loaded index keeps its curated summary + aliases.
+        text = "---\r\nsummary: Win fact\r\naliases: brandx\r\n---\r\n# body\r\n"
+        meta, body = playbook._parse_frontmatter(text)
+        self.assertEqual(meta["summary"], "Win fact")
+        self.assertEqual(meta["aliases"], ["brandx"])
+
+    def test_no_frontmatter_is_passthrough(self) -> None:
+        text = "# Playbook — x\n\n## 2026-01-01 — hi\n\nbody\n"
+        meta, body = playbook._parse_frontmatter(text)
+        self.assertEqual(meta, {})
+        self.assertEqual(body, text)
+
+    def test_body_horizontal_rule_not_treated_as_frontmatter(self) -> None:
+        # A `---` that is NOT at the very top must be left in the body.
+        text = "# Playbook\n\nsome prose\n\n---\n\nmore\n"
+        meta, body = playbook._parse_frontmatter(text)
+        self.assertEqual(meta, {})
+        self.assertEqual(body, text)
+
+    # --- build_index hybrid -------------------------------------------------
+
+    def test_index_prefers_curated_summary(self) -> None:
+        playbook.append_lesson(
+            "alpha", "Newest headline", "lesson body",
+            summary="Curated one-liner", aliases=["alphabrand"],
+        )
+        idx = {r["slug"]: r for r in playbook.build_index()}
+        self.assertEqual(idx["alpha"]["summary"], "Curated one-liner")
+        self.assertEqual(idx["alpha"]["aliases"], ["alphabrand"])
+        self.assertEqual(idx["alpha"]["source"], "summary")
+
+    def test_index_falls_back_to_newest_headline(self) -> None:
+        # No summary set -> index uses the latest dated headline (legacy shape).
+        playbook.append_lesson("beta", "First lesson", "b1")
+        playbook.append_lesson("beta", "Second lesson", "b2")
+        rec = next(r for r in playbook.build_index() if r["slug"] == "beta")
+        self.assertEqual(rec["summary"], "Second lesson")
+        self.assertEqual(rec["source"], "headline")
+        self.assertEqual(rec["aliases"], [])
+
+    def test_index_skips_archive_files(self) -> None:
+        playbook.append_lesson("gamma", "h", "g")
+        # create a stray archive file; it must not appear as its own client
+        playbook._slug_path("gamma", archive=True).write_text("# archive\n")
+        slugs = [r["slug"] for r in playbook.build_index()]
+        self.assertIn("gamma", slugs)
+        self.assertNotIn("gamma.archive", slugs)
+
+    # --- set_meta (backfill, no new entry) ---------------------------------
+
+    def test_set_meta_curates_without_adding_entry(self) -> None:
+        playbook.append_lesson("delta", "Only lesson", "d1")
+        before = playbook.read("delta").count("## ")
+        playbook.set_meta("delta", summary="Delta maps here", aliases=["deltabrand"])
+        after_text = playbook.read("delta")
+        self.assertEqual(after_text.count("## "), before)  # no new dated entry
+        self.assertTrue(after_text.startswith("---\nsummary: Delta maps here"))
+        self.assertIn("## 2", after_text)  # original entry preserved
+        rec = next(r for r in playbook.build_index() if r["slug"] == "delta")
+        self.assertEqual(rec["source"], "summary")
+        self.assertEqual(rec["aliases"], ["deltabrand"])
+
+    def test_aliases_merge_and_dedupe(self) -> None:
+        playbook.set_meta("eps", aliases=["one"])
+        playbook.set_meta("eps", aliases=["One", "two"])  # case-insensitive dupe
+        meta, _ = playbook._parse_frontmatter(playbook.read("eps"))
+        self.assertEqual(meta["aliases"], ["one", "two"])
+
+    # --- interaction with rotation -----------------------------------------
+
+    def test_frontmatter_survives_rotation(self) -> None:
+        playbook.set_meta("zeta", summary="sticky fact", aliases=["z"])
+        for i in range(playbook.MAX_LIVE_ENTRIES + 2):
+            playbook.append_lesson("zeta", f"entry {i}", f"body {i}")
+        live = playbook.read("zeta")
+        # frontmatter still on top after rotation
+        self.assertTrue(live.startswith("---\nsummary: sticky fact"))
+        # only MAX_LIVE_ENTRIES entries remain live; rest archived
+        self.assertEqual(len(playbook._ENTRY_HEADER.findall(live)), playbook.MAX_LIVE_ENTRIES)
+        self.assertTrue(playbook._slug_path("zeta", archive=True).exists())
+        # index still resolves the curated summary
+        rec = next(r for r in playbook.build_index() if r["slug"] == "zeta")
+        self.assertEqual(rec["summary"], "sticky fact")
+
+    def test_append_then_reparse_is_stable(self) -> None:
+        # Writing then re-parsing must not accumulate blank lines / drift.
+        playbook.append_lesson("eta", "h1", "b1", summary="s", aliases=["a"])
+        playbook.append_lesson("eta", "h2", "b2")
+        meta, body = playbook._parse_frontmatter(playbook.read("eta"))
+        self.assertEqual(meta["summary"], "s")
+        self.assertFalse(body.startswith("\n"))  # no leading blank-line buildup
+
+    # --- integrity: atomic writes, summary bound, alias delimiter ------------
+
+    def test_atomic_write_leaves_original_intact_on_failure(self) -> None:
+        # A crash mid-replace must never truncate an existing playbook.
+        playbook.set_meta("iota", summary="original")
+        path = playbook._slug_path("iota")
+        with mock.patch.object(playbook.os, "replace", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                playbook._atomic_write(path, "NEW CONTENT THAT MUST NOT LAND")
+        # original file untouched, no temp left behind
+        self.assertEqual(path.read_text(encoding="utf-8").splitlines()[0]
+                         if path.exists() else "", "---")
+        self.assertNotIn("NEW CONTENT", playbook.read("iota"))
+        leftover = [p for p in path.parent.glob(".tmp-*")]
+        self.assertEqual(leftover, [])
+
+    def test_summary_is_bounded_and_single_line(self) -> None:
+        playbook.set_meta("kappa", summary="x" * 500 + "\n## injected")
+        meta, _ = playbook._parse_frontmatter(playbook.read("kappa"))
+        self.assertLessEqual(len(meta["summary"]), playbook.MAX_SUMMARY_LEN)
+        self.assertNotIn("\n", meta["summary"])     # newline can't inject a key
+        self.assertNotIn("injected", meta["summary"])  # second line not swallowed as a fact
+
+    def test_comma_alias_rejected(self) -> None:
+        # Comma is the alias CSV delimiter; a comma-alias would split into two
+        # bogus tokens and silently corrupt brand->slug recall.
+        playbook.set_meta("lambda", aliases=["good", "bad,one"])
+        meta, _ = playbook._parse_frontmatter(playbook.read("lambda"))
+        self.assertEqual(meta["aliases"], ["good"])
+
+
+if __name__ == "__main__":
+    unittest.main()
