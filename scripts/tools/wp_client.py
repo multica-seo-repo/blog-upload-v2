@@ -1,6 +1,6 @@
 """Thin WordPress REST API wrapper — pure stdlib (urllib).
 
-Loads per-client credentials from data/secrets/<slug>.json (see
+Loads project-local credentials from the explicitly supplied path (see
 WPCredentials.load). Auth is HTTP Basic with a WP application password
 (username + app password).
 
@@ -130,43 +130,14 @@ class WPClient:
 
     def create_post(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {**payload}
-        payload.setdefault("status", "draft")
+        payload["status"] = "draft"
         return self._request(
             "POST", "posts", json_body=payload, action="create post",
         )
 
-    def delete_post(self, post_id: int, force: bool = True) -> dict[str, Any]:
-        return self._request(
-            "DELETE", f"posts/{post_id}", query={"force": str(force).lower()},
-            action=f"delete post {post_id}",
-        )
 
-    def delete_media(self, media_id: int, force: bool = True) -> dict[str, Any]:
-        return self._request(
-            "DELETE", f"media/{media_id}", query={"force": str(force).lower()},
-            action=f"delete media {media_id}",
-        )
 
-    def find_category_id(self, slug: str) -> int | None:
-        results = self._request(
-            "GET", "categories", query={"slug": slug},
-            action=f"lookup category '{slug}'",
-        )
-        return results[0]["id"] if results else None
 
-    def find_or_create_tag(self, name: str) -> int:
-        results = self._request(
-            "GET", "tags", query={"search": name},
-            action=f"lookup tag '{name}'",
-        )
-        for t in results:
-            if t.get("name", "").lower() == name.lower():
-                return t["id"]
-        created = self._request(
-            "POST", "tags", json_body={"name": name},
-            action=f"create tag '{name}'",
-        )
-        return created["id"]
 
     # --- internals --------------------------------------------------------
 
